@@ -8,28 +8,25 @@ import os
 
 app = FastAPI(title="PWID Risk Prediction API")
 
-# ---------------------------------------------------------
-# 1. LOAD THE SAVED MODEL
-# ---------------------------------------------------------
+# 1. LOAD MODEL
 MODEL_FILE = "pwid_risk_model_clinical_v2.joblib"
-
 if not os.path.exists(MODEL_FILE):
-    raise RuntimeError(f"CRITICAL ERROR: {MODEL_FILE} not found! Did you upload it?")
-
-print(f"Loading model from {MODEL_FILE}...")
+    raise RuntimeError(f"Model file {MODEL_FILE} not found!")
 model = joblib.load(MODEL_FILE)
-print("✅ Model loaded successfully.")
 
-# ---------------------------------------------------------
-# 2. INPUT SCHEMAS
-# ---------------------------------------------------------
-class PatientInput(BaseModel):
-    person_id: int
-    sleep_quality: int       
-    has_pain_or_gut_issue: bool 
+# 2. DEFINE INPUT SCHEMAS
+class DailyInput(BaseModel):
+    sleep_quality: int       # 1-5
+    has_pain_or_gut_issue: bool
     sensory_overload: bool
-    emotional_distress: bool 
+    emotional_distress: bool
     routine_change: bool
+
+class PredictionRequest(BaseModel):
+    person_id: int
+    current_input: DailyInput
+    # We now demand the history from the backend!
+    history_last_6_days: List[DailyInput] 
 
 class PredictionOutput(BaseModel):
     person_id: int
@@ -37,67 +34,67 @@ class PredictionOutput(BaseModel):
     risk_level: str
     contributing_factors: List[str]
 
-# ---------------------------------------------------------
-# 3. HELPER: MOCK HISTORY
-# ---------------------------------------------------------
-def get_patient_history(person_id: int):
-    # In real deployment, connect to MongoDB/SQL here
-    return pd.DataFrame({
-        'sleep_quality': np.random.randint(1, 6, size=6),
-        'bowel_issue': np.random.binomial(1, 0.3, size=6),
-        'sensory_overload': np.random.binomial(1, 0.2, size=6)
-    })
-
-# ---------------------------------------------------------
-# 4. PREDICT ENDPOINT
-# ---------------------------------------------------------
 @app.post("/predict", response_model=PredictionOutput)
-def predict_risk(input_data: PatientInput):
+def predict_risk(request: PredictionRequest):
     
-    # A. Fetch History
-    history_df = get_patient_history(input_data.person_id)
+    # A. PREPARE DATA
+    # Convert the list of Pydantic objects into a list of dictionaries
+    history_data = [item.dict() for item in request.history_last_6_days]
+    current_data = request.current_input.dict()
+    
+    # Create a DataFrame of all 7 days (History + Current)
+    all_days_df = pd.DataFrame(history_data + [current_data])
 
-    # B. Map User Inputs to Features
-    current_data = {
-        'sleep_hours': input_data.sleep_quality * 1.5 + 2, 
-        'sleep_quality': input_data.sleep_quality,
-        'bowel_issue': 1 if input_data.has_pain_or_gut_issue else 0,
-        'pain_signs': 1 if input_data.has_pain_or_gut_issue else 0,
-        'sensory_overload': 1 if input_data.sensory_overload else 0,
-        'routine_disruption': 1 if input_data.routine_change else 0,
-        'comm_frustration': 1 if input_data.emotional_distress else 0
+    # Check if we actually have enough data
+    if len(all_days_df) < 1:
+        raise HTTPException(status_code=400, detail="Not enough data to predict.")
+
+    # B. FEATURE ENGINEERING (The Python Logic)
+    # We map the simple inputs to the model's complex features for the CURRENT day
+    row_for_model = {
+        'sleep_hours': current_data['sleep_quality'] * 1.5 + 2, 
+        'sleep_quality': current_data['sleep_quality'],
+        'bowel_issue': 1 if current_data['has_pain_or_gut_issue'] else 0,
+        'pain_signs': 1 if current_data['has_pain_or_gut_issue'] else 0,
+        'sensory_overload': 1 if current_data['sensory_overload'] else 0,
+        'routine_disruption': 1 if current_data['routine_change'] else 0,
+        'comm_frustration': 1 if current_data['emotional_distress'] else 0
     }
 
-    # C. Calculate Rolling Averages
-    full_sleep = np.append(history_df['sleep_quality'].values, current_data['sleep_quality'])
-    full_bowel = np.append(history_df['bowel_issue'].values, current_data['bowel_issue'])
-    full_sensory = np.append(history_df['sensory_overload'].values, current_data['sensory_overload'])
+    # C. CALCULATE ROLLING AVERAGES (The Magic)
+    # We take the mean of the column 'sleep_quality' from the 7-day DataFrame
+    row_for_model['sleep_quality_avg_7d'] = all_days_df['sleep_quality'].mean()
+    
+    # Map boolean inputs to 0/1 for averages
+    all_days_df['bowel_int'] = all_days_df['has_pain_or_gut_issue'].astype(int)
+    row_for_model['bowel_issue_avg_7d'] = all_days_df['bowel_int'].mean()
 
-    current_data['sleep_quality_avg_7d'] = full_sleep.mean()
-    current_data['bowel_issue_avg_7d'] = full_bowel.mean()
-    current_data['sensory_overload_avg_7d'] = full_sensory.mean()
+    all_days_df['sensory_int'] = all_days_df['sensory_overload'].astype(int)
+    row_for_model['sensory_overload_avg_7d'] = all_days_df['sensory_int'].mean()
 
-    # D. Prepare Final DataFrame (Order matters!)
+    # D. FINALIZE INPUT FOR MODEL
     model_columns = [
         "sleep_hours", "sleep_quality", "bowel_issue", "pain_signs", 
         "sensory_overload", "routine_disruption", "comm_frustration",
         "sleep_quality_avg_7d", "bowel_issue_avg_7d", "sensory_overload_avg_7d"
     ]
     
-    input_df = pd.DataFrame([current_data])[model_columns]
+    # Create final DataFrame (1 row)
+    input_df = pd.DataFrame([row_for_model])[model_columns]
 
-    # E. Predict
+    # E. PREDICT
     probability = model.predict_proba(input_df)[0][1]
     
+    # F. INTERPRETATION
     risk_level = "High" if probability > 0.7 else "Moderate" if probability > 0.4 else "Low"
     
     factors = []
-    if current_data['sleep_quality_avg_7d'] < 3: factors.append("Poor Sleep History")
-    if current_data['bowel_issue'] == 1: factors.append("Physical Discomfort")
-    if probability > 0.6 and not factors: factors.append("Combined Triggers")
+    if row_for_model['sleep_quality_avg_7d'] < 3: factors.append("Consistent Poor Sleep")
+    if row_for_model['bowel_issue'] == 1: factors.append("Physical Discomfort")
+    if probability > 0.6 and not factors: factors.append("Accumulated Stress")
 
     return {
-        "person_id": input_data.person_id,
+        "person_id": request.person_id,
         "risk_probability": round(probability, 2),
         "risk_level": risk_level,
         "contributing_factors": factors
